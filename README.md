@@ -1,5 +1,7 @@
 # ctxaudit
 
+[![PyPI](https://img.shields.io/pypi/v/ctxaudit)](https://pypi.org/project/ctxaudit/)
+
 Audit the invisible context tax from agent skills, rules, and instruction files.
 
 Every AI coding agent silently loads skills, rules, and instruction files into your context window. Most of this context is stale, duplicated, or irrelevant to what you're actually doing -- and it actively degrades agent performance. More context doesn't mean better results. Irrelevant instructions compete for attention, contradict each other, and push useful conversation history out of the window faster.
@@ -16,6 +18,8 @@ Or install permanently:
 
 ```bash
 uv tool install ctxaudit
+# or
+pip install ctxaudit
 ```
 
 ## What it scans
@@ -75,6 +79,7 @@ Project-Level
 ```bash
 ctxaudit              # Scan user-level + current project
 ctxaudit --user-only  # Scan user-level only (no project context)
+ctxaudit --verbose    # Show detailed file-by-file breakdown
 ```
 
 ## Loading behavior by file type
