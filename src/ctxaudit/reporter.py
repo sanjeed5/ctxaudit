@@ -13,6 +13,12 @@ CONTEXT_WINDOW = 200_000
 SYSTEM_OVERHEAD_LOW = 15_000
 SYSTEM_OVERHEAD_HIGH = 30_000
 
+FIX_PROMPT = (
+    "Run `uvx ctxaudit` and fix the issues it reports. "
+    "Skills over 5,000 tokens should be refactored -- move detailed content into references/ or assets/ subdirectories. "
+    "Remove duplicate skills after asking me which copy to keep."
+)
+
 
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
@@ -20,16 +26,152 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def _pct_style(pct_high: float) -> str:
+    if pct_high < 10:
+        return "green"
+    if pct_high < 25:
+        return "yellow"
+    return "red"
+
+
+def _project_label(user_only: bool) -> str:
+    if user_only:
+        return "user-level only"
+    cwd = Path.cwd()
+    try:
+        return "~/" + str(cwd.relative_to(Path.home()))
+    except ValueError:
+        return str(cwd)
+
+
+# ---------------------------------------------------------------------------
+# Compact output (default)
+# ---------------------------------------------------------------------------
+
+
+def _render_compact(console: Console, result: ScanResult, user_only: bool) -> None:
+    label = _project_label(user_only)
+    console.print()
+    console.print(f"  [bold]CONTEXT AUDIT[/bold]  [dim]({label})[/dim]")
+    console.print(f"  {'─' * 54}")
+    console.print()
+
+    per_agent = result.per_agent_startup()
+    if not per_agent:
+        console.print("  [dim]No context files found.[/dim]")
+        console.print()
+        return
+
+    for agent, tokens in per_agent.items():
+        eff_low = tokens + SYSTEM_OVERHEAD_LOW
+        eff_high = tokens + SYSTEM_OVERHEAD_HIGH
+        pct_low = (eff_low / CONTEXT_WINDOW) * 100
+        pct_high = (eff_high / CONTEXT_WINDOW) * 100
+        style = _pct_style(pct_high)
+        console.print(
+            f"  {agent:<22} {_fmt_tokens(tokens):>6} tokens"
+            f"    [{style}]{pct_low:.0f}-{pct_high:.0f}% of context[/{style}]"
+        )
+
+    # Collect issues
+    issues: list[str] = []
+
+    oversized = sorted(
+        [s for s in result.skills() if s.full_tokens > RECOMMENDED_SKILL_TOKENS],
+        key=lambda s: s.full_tokens,
+        reverse=True,
+    )
+    if oversized:
+        biggest = oversized[0]
+        issues.append(
+            f"{len(oversized)} skill{'s' if len(oversized) != 1 else ''} "
+            f"exceed {RECOMMENDED_SKILL_TOKENS:,} tokens "
+            f"(largest: {biggest.name} at {_fmt_tokens(biggest.full_tokens)})"
+        )
+
+    dupes = result.duplicates()
+    for name, files in dupes.items():
+        all_readers: list[set[str]] = [set(f.readers) for f in files]
+        shared: set[str] = set()
+        for i, r1 in enumerate(all_readers):
+            for r2 in all_readers[i + 1:]:
+                shared |= r1 & r2
+        affected = ", ".join(sorted(shared))
+        issues.append(f"{name} seen twice by {affected}")
+
+    if issues:
+        console.print()
+        console.print(f"  {'─' * 54}")
+        console.print()
+        console.print("  [bold]Issues[/bold]")
+        for issue in issues:
+            console.print(f"    [yellow]!![/yellow] {issue}")
+
+        console.print()
+        console.print(f"  [dim]  Run [/dim][italic]ctxaudit -v[/italic][dim] for details. Paste the fix prompt into your agent:[/dim]")
+        console.print(f"  [italic]{FIX_PROMPT}[/italic]")
+
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Verbose output (--verbose)
+# ---------------------------------------------------------------------------
+
+
+def _short_path(f: ContextFile) -> str:
+    if f.scope == "project":
+        try:
+            return str(f.path.relative_to(Path.cwd()))
+        except ValueError:
+            pass
+    return f.display_path
+
+
+def _skill_group_location(skills: list[ContextFile]) -> str:
+    parents = sorted({s.path.parent for s in skills})
+    home = Path.home()
+
+    def _short(p: Path) -> str:
+        try:
+            return "~/" + str(p.relative_to(home))
+        except ValueError:
+            try:
+                return str(p.relative_to(Path.cwd()))
+            except ValueError:
+                return str(p)
+
+    deduped: list[Path] = []
+    for p in parents:
+        if not any(p != existing and _is_subpath(p, existing) for existing in parents):
+            deduped.append(p)
+
+    if len(deduped) == 1:
+        return _short(deduped[0])
+    return ", ".join(_short(p) for p in deduped)
+
+
+def _is_subpath(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _loading_label(f: ContextFile) -> str:
+    if f.is_always_loaded:
+        return "always"
+    if f.is_on_demand:
+        return f"on-demand ({_fmt_tokens(f.full_tokens)} full)"
+    return f"description ({_fmt_tokens(f.full_tokens)} full)"
+
+
 def _group_by_platform(files: list[ContextFile]) -> dict[str, list[ContextFile]]:
     groups: dict[str, list[ContextFile]] = defaultdict(list)
     for f in files:
         groups[f.platform].append(f)
-    return dict(sorted(groups.items(), key=lambda x: (-_platform_sort_key(x[0]), x[0])))
-
-
-def _platform_sort_key(platform: str) -> int:
-    """Cross-Platform first, then alphabetical."""
-    return 1 if platform == "Cross-Platform" else 0
+    return dict(sorted(groups.items(), key=lambda x: (-(x[0] == "Cross-Platform"), x[0])))
 
 
 def _render_scope_section(console: Console, title: str, files: list[ContextFile]) -> None:
@@ -64,9 +206,7 @@ def _render_scope_section(console: Console, title: str, files: list[ContextFile]
             skill_startup = sum(s.startup_tokens for s in skills)
             skill_full = sum(s.full_tokens for s in skills)
             disabled = sum(1 for s in skills if s.startup_tokens == 0)
-
             location = _skill_group_location(skills)
-
             line = f"    {location:<42} {_fmt_tokens(skill_startup):>6} startup    {_fmt_tokens(skill_full):>6} full"
             if disabled:
                 line += f"  ({disabled} disabled)"
@@ -91,186 +231,10 @@ def _render_scope_section(console: Console, title: str, files: list[ContextFile]
                 console.print(f"      [dim]→ {reader_str}[/dim]")
 
 
-def _short_path(f: ContextFile) -> str:
-    """Concise path: ~/... for user scope, relative for project scope."""
-    if f.scope == "project":
-        try:
-            return str(f.path.relative_to(Path.cwd()))
-        except ValueError:
-            pass
-    return f.display_path
-
-
-def _skill_group_location(skills: list[ContextFile]) -> str:
-    """Show the common parent directory for a group of skills."""
-    parents = sorted({s.path.parent for s in skills})
-    home = Path.home()
-
-    def _short(p: Path) -> str:
-        try:
-            return "~/" + str(p.relative_to(home))
-        except ValueError:
-            try:
-                return str(p.relative_to(Path.cwd()))
-            except ValueError:
-                return str(p)
-
-    # Remove children when a parent already covers them
-    deduped: list[Path] = []
-    for p in parents:
-        if not any(p != existing and _is_subpath(p, existing) for existing in parents):
-            deduped.append(p)
-
-    if len(deduped) == 1:
-        return _short(deduped[0])
-    return ", ".join(_short(p) for p in deduped)
-
-
-def _is_subpath(child: Path, parent: Path) -> bool:
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
-def _loading_label(f: ContextFile) -> str:
-    if f.is_always_loaded:
-        return "always"
-    if f.is_on_demand:
-        return f"on-demand ({_fmt_tokens(f.full_tokens)} full)"
-    return f"description ({_fmt_tokens(f.full_tokens)} full)"
-
-
-def _render_per_agent(console: Console, result: ScanResult) -> None:
-    per_agent = result.per_agent_startup()
-    if not per_agent:
-        return
-
+def _render_verbose(console: Console, result: ScanResult, user_only: bool) -> None:
+    label = _project_label(user_only)
     console.print()
-    console.print("  [bold]Per-Agent Startup[/bold] [dim](what each agent actually loads)[/dim]")
-    for agent, tokens in per_agent.items():
-        effective_low = tokens + SYSTEM_OVERHEAD_LOW
-        effective_high = tokens + SYSTEM_OVERHEAD_HIGH
-        pct_low = (effective_low / CONTEXT_WINDOW) * 100
-        pct_high = (effective_high / CONTEXT_WINDOW) * 100
-        if pct_high < 10:
-            pct_style = "green"
-        elif pct_high < 25:
-            pct_style = "yellow"
-        else:
-            pct_style = "red"
-        console.print(
-            f"    {agent:<22} {_fmt_tokens(tokens):>6} tokens"
-            f"    [{pct_style}]{pct_low:.0f}-{pct_high:.0f}%[/{pct_style}] effective"
-        )
-
-
-def _render_largest(console: Console, result: ScanResult) -> None:
-    skills = sorted(result.skills(), key=lambda s: s.full_tokens, reverse=True)[:5]
-    if not skills:
-        return
-
-    console.print()
-    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
-    table.add_column("Skill")
-    table.add_column("Location")
-    table.add_column("Tokens", justify="right")
-    table.add_column("")
-
-    for s in skills:
-        flag = "[red]!![/red]" if s.full_tokens > RECOMMENDED_SKILL_TOKENS else ""
-        table.add_row(s.name or "?", s.display_path, _fmt_tokens(s.full_tokens), flag)
-
-    console.print("  [bold]Largest Skills[/bold]")
-    console.print(table)
-
-
-def _render_duplicates(console: Console, result: ScanResult) -> None:
-    dupes = result.duplicates()
-    if not dupes:
-        return
-
-    console.print()
-    console.print("  [bold]Duplicates[/bold] [dim](same skill visible to the same agent)[/dim]")
-    for name, files in dupes.items():
-        all_readers: list[set[str]] = [set(f.readers) for f in files]
-        shared: set[str] = set()
-        for i, r1 in enumerate(all_readers):
-            for r2 in all_readers[i + 1:]:
-                shared |= r1 & r2
-        affected = ", ".join(sorted(shared))
-        locations = ", ".join(f.display_path for f in files)
-        console.print(f"    [yellow]{name}[/yellow] → {locations}")
-        console.print(f"      [dim]seen twice by: {affected}[/dim]")
-
-
-def _render_suggestions(console: Console, result: ScanResult) -> None:
-    suggestions = []
-
-    oversized = [s for s in result.skills() if s.full_tokens > RECOMMENDED_SKILL_TOKENS]
-    if oversized:
-        suggestions.append(
-            f"{len(oversized)} skill{'s' if len(oversized) != 1 else ''} "
-            f"exceed{'s' if len(oversized) == 1 else ''} the {RECOMMENDED_SKILL_TOKENS:,}-token recommendation"
-        )
-
-    dupes = result.duplicates()
-    if dupes:
-        for name in dupes:
-            suggestions.append(f'"{name}" duplicated across {len(dupes[name])} locations')
-
-    disabled = [s for s in result.skills() if s.startup_tokens == 0]
-    if disabled:
-        suggestions.append(
-            f"{len(disabled)} skill{'s' if len(disabled) != 1 else ''} "
-            f"excluded from startup (disable-model-invocation)"
-        )
-
-    if not suggestions:
-        return
-
-    console.print()
-    console.print("  [bold]Suggestions[/bold]")
-    for s in suggestions:
-        console.print(f"    [dim]•[/dim] {s}")
-
-
-FIX_PROMPT = (
-    "Run `uvx ctxaudit` and fix the issues it reports. "
-    "Skills over 5,000 tokens should be refactored -- move detailed content into references/ or assets/ subdirectories. "
-    "Remove duplicate skills after asking me which copy to keep."
-)
-
-
-def _render_fix_prompt(console: Console, result: ScanResult) -> None:
-    oversized = [s for s in result.skills() if s.full_tokens > RECOMMENDED_SKILL_TOKENS]
-    dupes = result.duplicates()
-    if not oversized and not dupes:
-        return
-
-    console.print()
-    console.print("  [bold]Fix Prompt[/bold] [dim](paste into your coding agent)[/dim]")
-    console.print(f"  [italic]{FIX_PROMPT}[/italic]")
-
-
-def render(result: ScanResult, user_only: bool = False) -> None:
-    console = Console()
-
-    if not result.files:
-        console.print("\n  [dim]No context files found.[/dim]\n")
-        return
-
-    cwd = Path.cwd()
-    home = Path.home()
-    try:
-        project_label = "~/" + str(cwd.relative_to(home))
-    except ValueError:
-        project_label = str(cwd)
-
-    header = f"CONTEXT AUDIT  [dim](project: {project_label})[/dim]" if not user_only else "CONTEXT AUDIT  [dim](user-level only)[/dim]"
-    console.print()
-    console.print(f"  [bold]{header}[/bold]")
+    console.print(f"  [bold]CONTEXT AUDIT[/bold]  [dim]({label})[/dim]")
     console.print(f"  {'─' * 54}")
 
     user_files = result.by_scope("user")
@@ -287,34 +251,97 @@ def render(result: ScanResult, user_only: bool = False) -> None:
     console.print(f"  {'─' * 54}")
     console.print()
 
-    startup = result.total_startup_tokens
-    pct = (startup / CONTEXT_WINDOW) * 100
+    # Per-agent totals
+    per_agent = result.per_agent_startup()
+    if per_agent:
+        console.print("  [bold]Per-Agent Startup[/bold]")
+        for agent, tokens in per_agent.items():
+            eff_low = tokens + SYSTEM_OVERHEAD_LOW
+            eff_high = tokens + SYSTEM_OVERHEAD_HIGH
+            pct_low = (eff_low / CONTEXT_WINDOW) * 100
+            pct_high = (eff_high / CONTEXT_WINDOW) * 100
+            style = _pct_style(pct_high)
+            console.print(
+                f"    {agent:<22} {_fmt_tokens(tokens):>6} tokens"
+                f"    [{style}]{pct_low:.0f}-{pct_high:.0f}%[/{style}] effective"
+            )
 
-    console.print(f"  [bold]Scannable context:[/bold] ~{_fmt_tokens(startup)} tokens loaded every session")
+    # Largest skills
+    skills = sorted(result.skills(), key=lambda s: s.full_tokens, reverse=True)[:5]
+    if skills:
+        console.print()
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Skill")
+        table.add_column("Location")
+        table.add_column("Tokens", justify="right")
+        table.add_column("")
+        for s in skills:
+            flag = "[red]!![/red]" if s.full_tokens > RECOMMENDED_SKILL_TOKENS else ""
+            table.add_row(s.name or "?", s.display_path, _fmt_tokens(s.full_tokens), flag)
+        console.print("  [bold]Largest Skills[/bold]")
+        console.print(table)
 
-    effective_low = startup + SYSTEM_OVERHEAD_LOW
-    effective_high = startup + SYSTEM_OVERHEAD_HIGH
-    pct_low = (effective_low / CONTEXT_WINDOW) * 100
-    pct_high = (effective_high / CONTEXT_WINDOW) * 100
+    # Duplicates
+    dupes = result.duplicates()
+    if dupes:
+        console.print()
+        console.print("  [bold]Duplicates[/bold] [dim](same skill visible to the same agent)[/dim]")
+        for name, files in dupes.items():
+            all_readers: list[set[str]] = [set(f.readers) for f in files]
+            shared: set[str] = set()
+            for i, r1 in enumerate(all_readers):
+                for r2 in all_readers[i + 1:]:
+                    shared |= r1 & r2
+            affected = ", ".join(sorted(shared))
+            locations = ", ".join(f.display_path for f in files)
+            console.print(f"    [yellow]{name}[/yellow] → {locations}")
+            console.print(f"      [dim]seen twice by: {affected}[/dim]")
 
-    console.print(f"  [bold]System overhead:[/bold]  ~{_fmt_tokens(SYSTEM_OVERHEAD_LOW)}-{_fmt_tokens(SYSTEM_OVERHEAD_HIGH)} tokens [dim](agent system prompt, tools, built-in instructions)[/dim]")
-    console.print(f"  [bold]Effective total:[/bold]  ~{_fmt_tokens(effective_low)}-{_fmt_tokens(effective_high)} tokens before you type anything")
+    # Suggestions
+    suggestions = []
+    oversized = [s for s in result.skills() if s.full_tokens > RECOMMENDED_SKILL_TOKENS]
+    if oversized:
+        suggestions.append(
+            f"{len(oversized)} skill{'s' if len(oversized) != 1 else ''} "
+            f"exceed{'s' if len(oversized) == 1 else ''} the {RECOMMENDED_SKILL_TOKENS:,}-token recommendation"
+        )
+    if dupes:
+        for name in dupes:
+            suggestions.append(f'"{name}" duplicated across {len(dupes[name])} locations')
+    disabled = [s for s in result.skills() if s.startup_tokens == 0]
+    if disabled:
+        suggestions.append(
+            f"{len(disabled)} skill{'s' if len(disabled) != 1 else ''} "
+            f"excluded from startup (disable-model-invocation)"
+        )
+    if suggestions:
+        console.print()
+        console.print("  [bold]Suggestions[/bold]")
+        for s in suggestions:
+            console.print(f"    [dim]•[/dim] {s}")
 
-    if pct_high < 10:
-        pct_style = "green"
-    elif pct_high < 25:
-        pct_style = "yellow"
+    # Fix prompt
+    if oversized or dupes:
+        console.print()
+        console.print("  [bold]Fix Prompt[/bold] [dim](paste into your coding agent)[/dim]")
+        console.print(f"  [italic]{FIX_PROMPT}[/italic]")
+
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def render(result: ScanResult, user_only: bool = False, verbose: bool = False) -> None:
+    console = Console()
+
+    if not result.files:
+        console.print("\n  [dim]No context files found.[/dim]\n")
+        return
+
+    if verbose:
+        _render_verbose(console, result, user_only)
     else:
-        pct_style = "red"
-    console.print(f"  [bold]Context used:[/bold]    [{pct_style}]{pct_low:.0f}-{pct_high:.0f}%[/{pct_style}] of {_fmt_tokens(CONTEXT_WINDOW)} token window")
-
-    console.print()
-    console.print(f"  {'─' * 54}")
-
-    _render_per_agent(console, result)
-    _render_largest(console, result)
-    _render_duplicates(console, result)
-    _render_suggestions(console, result)
-    _render_fix_prompt(console, result)
-
-    console.print()
+        _render_compact(console, result, user_only)
