@@ -142,6 +142,30 @@ def _loading_label(f: ContextFile) -> str:
     return f"description ({_fmt_tokens(f.full_tokens)} full)"
 
 
+def _render_per_agent(console: Console, result: ScanResult) -> None:
+    per_agent = result.per_agent_startup()
+    if not per_agent:
+        return
+
+    console.print()
+    console.print("  [bold]Per-Agent Startup[/bold] [dim](what each agent actually loads)[/dim]")
+    for agent, tokens in per_agent.items():
+        effective_low = tokens + SYSTEM_OVERHEAD_LOW
+        effective_high = tokens + SYSTEM_OVERHEAD_HIGH
+        pct_low = (effective_low / CONTEXT_WINDOW) * 100
+        pct_high = (effective_high / CONTEXT_WINDOW) * 100
+        if pct_high < 10:
+            pct_style = "green"
+        elif pct_high < 25:
+            pct_style = "yellow"
+        else:
+            pct_style = "red"
+        console.print(
+            f"    {agent:<22} {_fmt_tokens(tokens):>6} tokens"
+            f"    [{pct_style}]{pct_low:.0f}-{pct_high:.0f}%[/{pct_style}] effective"
+        )
+
+
 def _render_largest(console: Console, result: ScanResult) -> None:
     skills = sorted(result.skills(), key=lambda s: s.full_tokens, reverse=True)[:5]
     if not skills:
@@ -168,10 +192,17 @@ def _render_duplicates(console: Console, result: ScanResult) -> None:
         return
 
     console.print()
-    console.print("  [bold]Duplicates[/bold]")
+    console.print("  [bold]Duplicates[/bold] [dim](same skill visible to the same agent)[/dim]")
     for name, files in dupes.items():
+        all_readers: list[set[str]] = [set(f.readers) for f in files]
+        shared: set[str] = set()
+        for i, r1 in enumerate(all_readers):
+            for r2 in all_readers[i + 1:]:
+                shared |= r1 & r2
+        affected = ", ".join(sorted(shared))
         locations = ", ".join(f.display_path for f in files)
         console.print(f"    [yellow]{name}[/yellow] → {locations}")
+        console.print(f"      [dim]seen twice by: {affected}[/dim]")
 
 
 def _render_suggestions(console: Console, result: ScanResult) -> None:
@@ -280,6 +311,7 @@ def render(result: ScanResult, user_only: bool = False) -> None:
     console.print()
     console.print(f"  {'─' * 54}")
 
+    _render_per_agent(console, result)
     _render_largest(console, result)
     _render_duplicates(console, result)
     _render_suggestions(console, result)

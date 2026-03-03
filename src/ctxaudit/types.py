@@ -39,6 +39,7 @@ class ContextFile:
 @dataclass
 class ScanResult:
     files: list[ContextFile] = field(default_factory=list)
+    installed_agents: set[str] = field(default_factory=set)
 
     @property
     def total_startup_tokens(self) -> int:
@@ -58,9 +59,34 @@ class ScanResult:
         return [f for f in self.files if f.kind in ("skill", "plugin-skill")]
 
     def duplicates(self) -> dict[str, list[ContextFile]]:
-        """Find skills with the same name in different locations."""
+        """Find skills with the same name visible to the same reader."""
         by_name: dict[str, list[ContextFile]] = {}
         for f in self.skills():
             if f.name:
                 by_name.setdefault(f.name, []).append(f)
-        return {name: files for name, files in by_name.items() if len(files) > 1}
+
+        result: dict[str, list[ContextFile]] = {}
+        for name, files in by_name.items():
+            if len(files) < 2:
+                continue
+            # Only flag if at least one reader sees multiple copies
+            all_readers: set[str] = set()
+            has_overlap = False
+            for f in files:
+                file_readers = set(f.readers)
+                if file_readers & all_readers:
+                    has_overlap = True
+                all_readers |= file_readers
+            if has_overlap:
+                result[name] = files
+        return result
+
+    def per_agent_startup(self) -> dict[str, int]:
+        """Total startup tokens each installed agent actually sees."""
+        agents: dict[str, int] = {}
+        for f in self.files:
+            for reader in f.readers:
+                if self.installed_agents and reader not in self.installed_agents:
+                    continue
+                agents[reader] = agents.get(reader, 0) + f.startup_tokens
+        return dict(sorted(agents.items(), key=lambda x: -x[1]))

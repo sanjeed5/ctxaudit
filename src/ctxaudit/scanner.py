@@ -177,6 +177,58 @@ PLUGIN_DIRS: list[dict] = [
 ]
 
 
+# Maps reader names to home directories that indicate the agent is installed.
+# Sourced from vercel-labs/skills detectInstalled().
+AGENT_DETECT: dict[str, list[str]] = {
+    "Amp": ["~/.config/amp"],
+    "Antigravity": ["~/.gemini/antigravity"],
+    "Augment": ["~/.augment"],
+    "Claude Code": ["~/.claude"],
+    "Cline": ["~/.cline"],
+    "CodeBuddy": ["~/.codebuddy"],
+    "Codex": ["~/.codex"],
+    "Command Code": ["~/.commandcode"],
+    "Continue": ["~/.continue"],
+    "Cortex Code": ["~/.snowflake/cortex"],
+    "Crush": ["~/.config/crush"],
+    "Cursor": ["~/.cursor"],
+    "Droid": ["~/.factory"],
+    "Gemini CLI": ["~/.gemini"],
+    "GitHub Copilot": ["~/.copilot"],
+    "Goose": ["~/.config/goose"],
+    "iFlow CLI": ["~/.iflow"],
+    "Junie": ["~/.junie"],
+    "Kilo Code": ["~/.kilocode"],
+    "Kimi CLI": ["~/.kimi"],
+    "Kiro CLI": ["~/.kiro"],
+    "Kode": ["~/.kode"],
+    "MCPJam": ["~/.mcpjam"],
+    "Mistral Vibe": ["~/.vibe"],
+    "Mux": ["~/.mux"],
+    "Neovate": ["~/.neovate"],
+    "OpenClaw": ["~/.openclaw", "~/.clawdbot", "~/.moltbot"],
+    "OpenCode": ["~/.config/opencode"],
+    "OpenHands": ["~/.openhands"],
+    "Pi": ["~/.pi/agent"],
+    "Pochi": ["~/.pochi"],
+    "Qoder": ["~/.qoder"],
+    "Qwen Code": ["~/.qwen"],
+    "Roo Code": ["~/.roo"],
+    "Trae": ["~/.trae"],
+    "Trae CN": ["~/.trae-cn"],
+    "Windsurf": ["~/.codeium/windsurf"],
+    "Zencoder": ["~/.zencoder"],
+}
+
+
+def detect_installed_agents() -> set[str]:
+    installed: set[str] = set()
+    for agent, paths in AGENT_DETECT.items():
+        if any(Path(p).expanduser().exists() for p in paths):
+            installed.add(agent)
+    return installed
+
+
 # ---------------------------------------------------------------------------
 # Frontmatter parsing
 # ---------------------------------------------------------------------------
@@ -501,7 +553,7 @@ def _resolve(path_str: str) -> Path:
 
 
 def scan(user_only: bool = False) -> ScanResult:
-    result = ScanResult()
+    result = ScanResult(installed_agents=detect_installed_agents())
     project = Path.cwd()
 
     for entry in SKILL_DIRS:
